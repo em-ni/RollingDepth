@@ -1,5 +1,5 @@
 # Copyright 2024 Bingxin Ke, ETH Zurich. All rights reserved.
-# Last modified: 2024-12-06
+# Last modified: 2024-12-09
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -147,7 +147,7 @@ if "__main__" == __name__:
     parser.add_argument(
         "--fps",
         "--output-fps",
-        type=int,
+        type=float,
         default=0,
         help=(
             "Frame rate (FPS) for the output video. "
@@ -539,6 +539,11 @@ if "__main__" == __name__:
                 np.savez_compressed(save_to, **snippet_dict)
 
             # Colorize results
+            if args.output_fps > 0:
+                output_fps = args.output_fps
+            else:
+                output_fps = get_video_fps(video_path)
+
             for i_cmap, cmap in enumerate(args.color_maps):
                 if "" == cmap:
                     continue
@@ -551,12 +556,11 @@ if "__main__" == __name__:
                     verbose=args.verbose,
                 )  # [n h w 3], in [0, 255]
                 save_to = output_dir.joinpath(f"{video_path.stem}_{cmap}.mp4")
-                if not args.output_fps > 0:
-                    output_fps = int(get_video_fps(video_path))
+
                 write_video_from_numpy(
                     frames=colored_np,
                     output_path=save_to,
-                    fps=args.output_fps,
+                    fps=output_fps,
                     crf=23,
                     preset="medium",
                     verbose=args.verbose,
@@ -569,7 +573,9 @@ if "__main__" == __name__:
                         torch.from_numpy(colored_np), "n h w c -> n c h w"
                     )
                     concat_video = (
-                        concatenate_videos_horizontally_torch(rgb, colored_depth, gap=10)
+                        concatenate_videos_horizontally_torch(
+                            rgb, colored_depth, gap=10
+                        )
                         .int()
                         .numpy()
                         .astype(np.uint8)
@@ -579,7 +585,7 @@ if "__main__" == __name__:
                     write_video_from_numpy(
                         frames=concat_video,
                         output_path=save_to,
-                        fps=args.output_fps,
+                        fps=output_fps,
                         crf=23,
                         preset="medium",
                         verbose=args.verbose,
