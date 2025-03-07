@@ -1,5 +1,5 @@
 # Copyright 2024 Bingxin Ke, ETH Zurich. All rights reserved.
-# Last modified: 2024-12-04
+# Last modified: 2025-03-07
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -149,7 +149,7 @@ class RollingDepthPipeline(DiffusionPipeline):
             unload_snippet=unload_snippet,
         )
 
-        torch.cuda.empty_cache()  # clear vram cache for ensembling
+        torch.cuda.empty_cache()  # clear vram cache
 
         # ----------------- Resize back -----------------
         if restore_res:
@@ -450,12 +450,11 @@ class RollingDepthPipeline(DiffusionPipeline):
             # Decode to depth
             del depth_snippet_latent_ls
             triplets_decoded = self.decode_depth(
-                depth_snippet_latent, max_batch_size=max_vae_bs, verbose=verbose
+                depth_snippet_latent,
+                max_batch_size=max_vae_bs,
+                verbose=verbose,
+                unload_snippet=unload_snippet,
             )
-
-            # moved to CPU to save vram
-            if unload_snippet:
-                triplets_decoded = triplets_decoded.cpu()
 
             snippet_pred_ls.append(triplets_decoded)
             torch.cuda.empty_cache()
@@ -703,7 +702,11 @@ class RollingDepthPipeline(DiffusionPipeline):
         return rgb_latent
 
     def decode_depth(
-        self, depth_latent: torch.Tensor, max_batch_size: int, verbose: bool = False
+        self,
+        depth_latent: torch.Tensor,
+        max_batch_size: int,
+        verbose: bool = False,
+        unload_snippet: bool = False,
     ) -> torch.Tensor:
         self.vae = self.vae.to(self.device)
 
@@ -729,7 +732,10 @@ class RollingDepthPipeline(DiffusionPipeline):
             # decode
             z = self.vae.post_quant_conv(batch)
             stacked = self.vae.decoder(z)
+            if unload_snippet:
+                stacked = stacked.cpu()
             decoded_outputs.append(stacked)
+            torch.cuda.empty_cache()  # clear vram cache
         all_decoded = torch.cat(decoded_outputs, dim=0)
 
         # mean of output channels
