@@ -1,5 +1,5 @@
 # Copyright 2024 Dominik Narnhofer, Bingxin Ke, ETH Zurich. All rights reserved.
-# Last modified: 2024-11-27
+# Last modified: 2025-03-07
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -109,7 +109,7 @@ class DepthAligner:
             s_list=scales,
             t_list=translations,
             sequence_length=sequence_length,
-            device=device,
+            device=torch.device("cpu"),
         )
 
         return (
