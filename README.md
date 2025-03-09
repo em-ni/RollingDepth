@@ -23,6 +23,7 @@ This repository represents the official implementation of the paper titled "Vide
 
 
 ## 📢 News
+2025-02-26: Paper is accepted to CVPR. <br>
 2024-12-02: Paper is on arXiv.<br>
 2024-11-28: Inference code is released.<br>
 
