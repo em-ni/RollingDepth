@@ -1,5 +1,7 @@
 # 🛹 RollingDepth: Video Depth without Video Models
 
+**CVPR 2025**
+
 [![Website](doc/badges/badge-website.svg)](https://rollingdepth.github.io)
 [![Hugging Face Space](https://img.shields.io/badge/🤗%20Hugging%20Face%20-Space-yellow)](https://huggingface.co/spaces/prs-eth/rollingdepth)
 [![arXiv](https://img.shields.io/badge/arXiv-PDF-b31b1b)](http://arxiv.org/abs/2411.19189)
@@ -23,7 +25,7 @@ This repository represents the official implementation of the paper titled "Vide
 
 
 ## 📢 News
-2025-02-26: Paper is accepted to CVPR. <br>
+2025-02-26: Paper is accepted to CVPR 2025. <br>
 2024-12-02: Paper is on arXiv.<br>
 2024-11-28: Inference code is released.<br>
 
