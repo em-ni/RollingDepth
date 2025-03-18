@@ -131,14 +131,11 @@ Coming soon
 
 ## 🎓 Citation
 ```bibtex
-@misc{ke2024rollingdepth,
+@InProceedings{ke2024rollingdepth,
     title={Video Depth without Video Models}, 
     author={Bingxin Ke and Dominik Narnhofer and Shengyu Huang and Lei Ke and Torben Peters and Katerina Fragkiadaki and Anton Obukhov and Konrad Schindler},
-    year={2024},
-    eprint={2411.19189},
-    archivePrefix={arXiv},
-    primaryClass={cs.CV},
-    url={https://arxiv.org/abs/2411.19189}, 
+    booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+    year={2025}
 }
 ```
 
