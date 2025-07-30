@@ -2,8 +2,12 @@
 # ignore these folders
 /checkpoint
 /checkpoint/*
-/data
-/data/*
+/data/em/old
+/data/em/output*
+/data/em/phantom*
+/data/em/slam*
+/data/em/test*
+/data_split*
 /input
 /input/*
 /output
