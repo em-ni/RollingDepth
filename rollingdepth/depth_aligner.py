@@ -109,7 +109,8 @@ class DepthAligner:
             s_list=scales,
             t_list=translations,
             sequence_length=sequence_length,
-            device=torch.device("cpu"),
+            # device=torch.device("cpu"),
+            device=torch.device("cuda"),
         )
 
         return (
