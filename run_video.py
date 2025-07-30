@@ -22,6 +22,7 @@ import argparse
 import logging
 import os
 from pathlib import Path
+import time
 
 import numpy as np
 import torch
@@ -38,6 +39,7 @@ from rollingdepth import (
 )
 from src.util.colorize import colorize_depth_multi_thread
 from src.util.config import str2bool
+import cv2
 
 if "__main__" == __name__:
     logging.basicConfig(level=logging.INFO)
@@ -487,7 +489,36 @@ if "__main__" == __name__:
                 generator = torch.Generator(device=device)
                 generator.manual_seed(args.seed)
 
+            # Count number of frames in the video
+            video_length = 0
+            if video_path.is_file():
+                try:
+                    cap = cv2.VideoCapture(str(video_path))
+                    if not cap.isOpened():
+                        logging.error(f"Error opening video file: {video_path}")
+                        video_length = 0 # Or handle error as appropriate
+                    else:
+                        video_length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                        cap.release()
+                except ImportError:
+                    logging.warning("OpenCV (cv2) is not installed. Cannot count video frames explicitly. Falling back to a default or potentially inaccurate method if get_video_fps was also relying on it.")
+                    # Fallback or error if cv2 is essential and not just for this specific count
+                    video_length = 0 # Placeholder, as explicit counting failed
+                except Exception as e:
+                    logging.error(f"Error counting frames for {video_path}: {e}")
+                    video_length = 0
+
+                if args.frame_count > 0:
+                    video_length = min(video_length - args.start_frame, args.frame_count)
+                elif args.start_frame > 0:
+                    video_length = video_length - args.start_frame
+                
+                if video_length <= 0 and video_path.is_file():
+                    logging.warning(f"Video {video_path.name} has 0 or negative frames to process after considering start_frame and frame_count. Skipping.")
+                    continue
+
             # Predict depth
+            start_time = time.time()
             pipe_out: RollingDepthOutput = pipe(
                 # input setting
                 input_video_path=video_path,
@@ -501,7 +532,8 @@ if "__main__" == __name__:
                 snippet_lengths=list(args.snippet_lengths),
                 init_infer_steps=[1],
                 strides=[1],
-                coalign_kwargs=None,
+                # coalign_kwargs=None,
+                coalign_kwargs={'factor': 30},
                 refine_step=args.refine_step,
                 refine_snippet_len=args.refine_snippet_len,
                 refine_start_dilation=args.refine_start_dilation,
@@ -513,6 +545,9 @@ if "__main__" == __name__:
                 restore_res=args.restore_res,
                 unload_snippet=args.unload_snippet,
             )
+            end_time = time.time()
+            processing_time = end_time - start_time 
+            logging.info(f"Processing {video_path.name} took {processing_time:.2f} seconds for {video_length} frames. Time per frame: {processing_time / video_length:.2f} seconds.") 
 
             depth_pred = pipe_out.depth_pred  # [N 1 H W]
 
@@ -538,58 +573,59 @@ if "__main__" == __name__:
                     )  # [n_snip, snippet_len, H W]
                 np.savez_compressed(save_to, **snippet_dict)
 
-            # Colorize results
-            if args.output_fps > 0:
-                output_fps = args.output_fps
-            else:
-                output_fps = get_video_fps(video_path)
+            # Temp not saving videos
+            # # Colorize results
+            # if args.output_fps > 0:
+            #     output_fps = args.output_fps
+            # else:
+            #     output_fps = get_video_fps(video_path)
 
-            for i_cmap, cmap in enumerate(args.color_maps):
-                if "" == cmap:
-                    continue
-                colored_np = colorize_depth_multi_thread(
-                    depth=depth_pred.numpy(),
-                    valid_mask=None,
-                    chunk_size=4,
-                    num_threads=4,
-                    color_map=cmap,
-                    verbose=args.verbose,
-                )  # [n h w 3], in [0, 255]
-                save_to = output_dir.joinpath(f"{video_path.stem}_{cmap}.mp4")
+            # for i_cmap, cmap in enumerate(args.color_maps):
+            #     if "" == cmap:
+            #         continue
+            #     colored_np = colorize_depth_multi_thread(
+            #         depth=depth_pred.numpy(),
+            #         valid_mask=None,
+            #         chunk_size=4,
+            #         num_threads=4,
+            #         color_map=cmap,
+            #         verbose=args.verbose,
+            #     )  # [n h w 3], in [0, 255]
+            #     save_to = output_dir.joinpath(f"{video_path.stem}_{cmap}.mp4")
 
-                write_video_from_numpy(
-                    frames=colored_np,
-                    output_path=save_to,
-                    fps=output_fps,
-                    crf=23,
-                    preset="medium",
-                    verbose=args.verbose,
-                )
+            #     write_video_from_numpy(
+            #         frames=colored_np,
+            #         output_path=save_to,
+            #         fps=output_fps,
+            #         crf=23,
+            #         preset="medium",
+            #         verbose=args.verbose,
+            #     )
 
-                # Save side-by-side videos
-                if args.save_sbs and 0 == i_cmap:
-                    rgb = pipe_out.input_rgb * 255  # [N 3 H W]
-                    colored_depth = einops.rearrange(
-                        torch.from_numpy(colored_np), "n h w c -> n c h w"
-                    )
-                    concat_video = (
-                        concatenate_videos_horizontally_torch(
-                            rgb, colored_depth, gap=10
-                        )
-                        .int()
-                        .numpy()
-                        .astype(np.uint8)
-                    )
-                    concat_video = einops.rearrange(concat_video, "n c h w -> n h w c")
-                    save_to = output_dir.joinpath(f"{video_path.stem}_rgbd.mp4")
-                    write_video_from_numpy(
-                        frames=concat_video,
-                        output_path=save_to,
-                        fps=output_fps,
-                        crf=23,
-                        preset="medium",
-                        verbose=args.verbose,
-                    )
+            #     # Save side-by-side videos
+            #     if args.save_sbs and 0 == i_cmap:
+            #         rgb = pipe_out.input_rgb * 255  # [N 3 H W]
+            #         colored_depth = einops.rearrange(
+            #             torch.from_numpy(colored_np), "n h w c -> n c h w"
+            #         )
+            #         concat_video = (
+            #             concatenate_videos_horizontally_torch(
+            #                 rgb, colored_depth, gap=10
+            #             )
+            #             .int()
+            #             .numpy()
+            #             .astype(np.uint8)
+            #         )
+            #         concat_video = einops.rearrange(concat_video, "n c h w -> n h w c")
+            #         save_to = output_dir.joinpath(f"{video_path.stem}_rgbd.mp4")
+            #         write_video_from_numpy(
+            #             frames=concat_video,
+            #             output_path=save_to,
+            #             fps=output_fps,
+            #             crf=23,
+            #             preset="medium",
+            #             verbose=args.verbose,
+            #         )
 
         logging.info(
             f"Finished. {len(video_iterable)} predictions are saved to {output_dir}"
