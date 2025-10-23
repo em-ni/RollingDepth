@@ -1986,20 +1986,24 @@ class XFormersAttnProcessor:
             batch_size, channel, height, width = hidden_states.shape
             hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
 
-        # <<<*** Modified in RollingDepth  <<<***
+        # <<<*** Modified in RollingDepth (training mode only)  <<<***
         is_self_attn = encoder_hidden_states is None
+        
+        # Store original residual shape before any rearrangement (only in training mode)
+        original_residual = None
+        if num_view is not None:  # Only in training mode when num_view is passed
+            original_residual = residual.clone() if residual is not None else None
 
-        if is_self_attn:
-            # Rearrange for self-attention
-            if num_view is not None:
+            if is_self_attn and num_view > 1:  # Apply rearrangement only if num_view > 1
                 hidden_states = einops.rearrange(hidden_states, "(b n) hw c -> b (n hw) c", n=num_view)
-        else:
-            # Repeat along batch for cross-attention
+        
+        if not is_self_attn:
+            # Repeat along batch for cross-attention (always, not dependent on training mode)
             if encoder_hidden_states.shape[0] != hidden_states.shape[0]:
                 encoder_hidden_states = einops.repeat(
                     encoder_hidden_states, "1 hw c -> b hw c", b=hidden_states.shape[0]
                 )
-        # ***>>> Modified in RollingDepth  ***>>>
+        # ***>>> Modified in RollingDepth (training mode only)  ***>>>
 
         batch_size, key_tokens, _ = (
             hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
@@ -2044,16 +2048,23 @@ class XFormersAttnProcessor:
         # dropout
         hidden_states = attn.to_out[1](hidden_states)
 
-        # <<<*** Modified in RollingDepth  <<<***
-        if is_self_attn and (num_view is not None):
+        # <<<*** Modified in RollingDepth (training mode only)  <<<***
+        # Only un-rearrange if rearrangement was applied during training
+        if is_self_attn and num_view is not None and num_view > 1:
             hidden_states = einops.rearrange(hidden_states, "b (n hw) c -> (b n) hw c", n=num_view)
-        # ***>>> Modified in RollingDepth  ***>>>
+        # ***>>> Modified in RollingDepth (training mode only)  ***>>>
 
         if input_ndim == 4:
             hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
 
         if attn.residual_connection:
-            hidden_states = hidden_states + residual
+            # <<<*** Modified in RollingDepth (training mode only)  <<<***
+            # Use the stored original residual if it was saved (training mode with num_view)
+            if original_residual is not None:
+                hidden_states = hidden_states + original_residual
+            else:
+                hidden_states = hidden_states + residual
+            # ***>>> Modified in RollingDepth (training mode only)  ***>>>
 
         hidden_states = hidden_states / attn.rescale_output_factor
 
@@ -2205,10 +2216,14 @@ class AttnProcessor2_0:
             batch_size, channel, height, width = hidden_states.shape
             hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
 
-        # <<<*** Modified in RollingDepth  <<<***
-        if num_view is not None:
-            hidden_states = einops.rearrange(hidden_states, "(b n) hw c -> b (n hw) c", n=num_view)
-        # ***>>> Modified in RollingDepth  ***>>>
+        # <<<*** Modified in RollingDepth (training mode only)  <<<***
+        # Only apply cross-frame attention rearrangement when training with num_view parameter
+        original_residual_2_0 = None
+        if num_view is not None:  # Only in training mode when num_view is passed
+            original_residual_2_0 = residual.clone() if residual is not None else None
+            if num_view > 1:  # Apply rearrangement only if num_view > 1
+                hidden_states = einops.rearrange(hidden_states, "(b n) hw c -> b (n hw) c", n=num_view)
+        # ***>>> Modified in RollingDepth (training mode only)  ***>>>
 
         batch_size, sequence_length, _ = (
             hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
@@ -2260,16 +2275,22 @@ class AttnProcessor2_0:
         # dropout
         hidden_states = attn.to_out[1](hidden_states)
 
-        # <<<*** Modified in RollingDepth  <<<***
-        if num_view is not None:
+        # <<<*** Modified in RollingDepth (training mode only)  <<<***
+        if num_view is not None and num_view > 1:  # Only un-rearrange if rearrangement was applied
             hidden_states = einops.rearrange(hidden_states, "b (n hw) c -> (b n) hw c", n=num_view)
-        # ***>>> Modified in RollingDepth  ***>>>
+        # ***>>> Modified in RollingDepth (training mode only)  ***>>>
 
         if input_ndim == 4:
             hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
 
         if attn.residual_connection:
-            hidden_states = hidden_states + residual
+            # <<<*** Modified in RollingDepth (training mode only)  <<<***
+            # Use the stored original residual if it was saved (training mode with num_view)
+            if original_residual_2_0 is not None:
+                hidden_states = hidden_states + original_residual_2_0
+            else:
+                hidden_states = hidden_states + residual
+            # ***>>> Modified in RollingDepth (training mode only)  ***>>>
 
         hidden_states = hidden_states / attn.rescale_output_factor
 
