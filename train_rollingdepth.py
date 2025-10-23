@@ -3,13 +3,20 @@ python train_rollingdepth.py \
     --dataset_dir data/em/train \
     --val_dataset_dir data/em/val \
     --output_dir ./finetuned \
-    --batch_size 4 \
-    --num_epochs 10 \
-    --learning_rate 5e-5 \
-    --gradient_accumulation_steps 2 \
+    --batch_size 2 \
+    --num_epochs 1 \
+    --learning_rate 1e-5 \
+    --gradient_accumulation_steps 4 \
     --depth_range 0.1 1000.0 \
     --depth_map_factor 5000.0 \
     --mixed_precision fp32 2>&1 
+
+
+The original paper trained for ~18k iterations on 4 A100 GPUs with batch size of 32.
+An iteration correspond to a weight update step, so 18k iter means weights were updated 18k times.
+So the number of iterations is
+iter = (total samples * num epochs) / (batch_size * gradient_accumulation_steps)
+ex: (10000 * 2) / (4 * 2) = 1250  for 2 epochs on 10,000 samples with batch size 4 and grad acc 2
 """
 
 import argparse
@@ -19,6 +26,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import json
 from datetime import datetime
+import sys
 
 import numpy as np
 import torch
@@ -288,7 +296,10 @@ class RollingDepthTrainer:
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
+        self.run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.run_dir = self.output_dir / self.run_id
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+            
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.warmup_steps = warmup_steps
@@ -380,7 +391,7 @@ class RollingDepthTrainer:
         logger.info(f"Starting training for {self.num_epochs} epochs")
         logger.info(f"Trainable parameters: {self._count_trainable_params()}")
         logger.info(f"Batch size: {self.batch_size} (effective: {self.batch_size * self.gradient_accumulation_steps})")
-        
+        logger.info(f"Total iterations: {len(train_dataloader) * self.num_epochs // (self.batch_size * self.gradient_accumulation_steps)}")
         # Setup learning rate scheduler
         total_steps = len(train_dataloader) * self.num_epochs // self.gradient_accumulation_steps
         self.lr_scheduler = CosineAnnealingLR(self.optimizer, T_max=total_steps)
@@ -580,7 +591,7 @@ class RollingDepthTrainer:
     
     def _save_checkpoint(self, epoch: int, is_best: bool = False):
         """Save model checkpoint"""
-        save_dir = self.output_dir / (f"checkpoint_best" if is_best else f"checkpoint_epoch_{epoch}")
+        save_dir = self.run_dir / (f"checkpoint_best" if is_best else f"checkpoint_epoch_{epoch}")
         save_dir.mkdir(exist_ok=True)
         
         # Save UNet
@@ -606,7 +617,8 @@ class RollingDepthTrainer:
     
     def _save_history(self):
         """Save training history"""
-        history_path = self.output_dir / "training_history.json"
+        # Save history inside the run folder so multiple runs don't overwrite each other
+        history_path = self.run_dir / "training_history.json"
         with open(history_path, 'w') as f:
             json.dump(self.training_history, f, indent=2)
 
