@@ -52,7 +52,7 @@ class VideoDepthDataset(Dataset):
         max_frames_per_video: int = 0,
         max_total_frames: int = 0,
         image_size: Tuple[int, int] = (512, 512),
-        depth_range: Tuple[float, float] = (0.1, 10.0),
+        depth_range: Tuple[float, float] = (0.1, 1000.0),
         depth_map_factor: float = 5000.0,
         normalize_depth: bool = True,
     ):
@@ -652,7 +652,7 @@ def main():
     parser.add_argument("--max_frames_per_video", type=int, default=0)
     parser.add_argument("--max_total_frames", type=int, default=0)
     parser.add_argument("--image_size", type=int, nargs=2, default=[512, 512])
-    parser.add_argument("--depth_range", type=float, nargs=2, default=[0.1, 10.0], help="Depth range in meters (near, far)")
+    parser.add_argument("--depth_range", type=float, nargs=2, default=[0.1, 1000.0], help="Depth range in meters (near, far)")
     parser.add_argument("--depth_map_factor", type=float, default=5000.0, help="Depth scale factor used by simulator (e.g., 5000 means 1m = 5000 uint16 units)")
     
     # Other arguments
