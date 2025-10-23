@@ -2,12 +2,16 @@
 # ignore these folders
 /checkpoint
 /checkpoint/*
+/finetuned*
 /data/samples
 /data/em/old
 /data/em/output*
 /data/em/phantom*
 /data/em/slam*
 /data/em/test*
+/data/em/train*
+/data/em/val*
+/data/em/sim*
 /data_split
 /input
 /input/*
