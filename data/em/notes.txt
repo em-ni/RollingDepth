@@ -20,3 +20,30 @@ python create_orb_slam_input.py --input-video-dir FOLDER_WITH_VIDEOS --depth-dir
 
 # Utils
 source ~/miniconda3/bin/activate
+
+
+# Depth tranformations
+BronchoSim saves depth as:
+# raw depth comes normalized from 0 to 1
+depth = get_depth_image(self.depthTex) 
+# linearize it with near and far planes (0.1, 1000.0)
+depth_linear = (2.0 * near_plane * far_plane) / (far_plane + near_plane - (2.0 * depth - 1.0) * (far_plane - near_plane))
+# multiply by depth factor for ORBSLAM use 
+depth_slam = (depth_linear * depth_map_factor).astype(np.uint16)
+
+RollingDepth predicts depth as:
+inverse_depth = 1/depth
+pred = RD(rgb) in [-1,1]
+pred * scale + shift = 1/gt_depth
+
+So to compare them I have to
+# divide the gt by depth_map_factor
+gt_depth_meter = gt_depth / depth_map_factor
+# compute inverse depth prediction
+inv_pred = pred * scale + shift
+depth_meter = 1 / inv_pred
+# compare 
+MAE/RMSE(gt_depth_meter,depth_meter)
+
+
+
