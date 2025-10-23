@@ -2,6 +2,10 @@ import os
 import re
 import shutil
 
+"""
+Script for processing BronchoSim output folder into the required format for RollingDepth training/evaluation.
+"""
+
 def process_folder(root_folder):
     print(f"Processing folder: {root_folder}")
     # Loop through all subfolders in the root directory

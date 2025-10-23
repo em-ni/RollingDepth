@@ -25,7 +25,7 @@ source ~/miniconda3/bin/activate
 # Depth tranformations
 BronchoSim saves depth as:
 # raw depth comes normalized from 0 to 1
-depth = get_depth_image(self.depthTex) 
+depth = get_depth_image(self.depthTex) in [0,1]
 # linearize it with near and far planes (0.1, 1000.0)
 depth_linear = (2.0 * near_plane * far_plane) / (far_plane + near_plane - (2.0 * depth - 1.0) * (far_plane - near_plane))
 # multiply by depth factor for ORBSLAM use 

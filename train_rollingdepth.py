@@ -1,7 +1,16 @@
-# Copyright 2024 RollingDepth Contributors. All rights reserved.
-# Finetuning script for RollingDepth model
-#
-# Licensed under the Apache License, Version 2.0
+"""
+python train_rollingdepth.py \
+    --dataset_dir data/em/train \
+    --val_dataset_dir data/em/val \
+    --output_dir ./finetuned \
+    --batch_size 4 \
+    --num_epochs 10 \
+    --learning_rate 5e-5 \
+    --gradient_accumulation_steps 2 \
+    --depth_range 0.1 1000.0 \
+    --depth_map_factor 5000.0 \
+    --mixed_precision fp32 2>&1 
+"""
 
 import argparse
 import logging
