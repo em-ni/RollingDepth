@@ -9,7 +9,9 @@ python train_rollingdepth.py \
     --gradient_accumulation_steps 4 \
     --depth_range 0.1 1000.0 \
     --depth_map_factor 5000.0 \
-    --mixed_precision fp32 2>&1 
+    --mixed_precision fp32 2>&1 \
+    --save_every_steps 500 \
+    --depth_recon_weight 0.0
 
 
 The original paper trained for ~18k iterations on 4 A100 GPUs with batch size of 32.
@@ -33,13 +35,17 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import einops
 from tqdm.auto import tqdm
 from diffusers import DDIMScheduler
 from omegaconf import OmegaConf
 
 from rollingdepth import RollingDepthPipeline
+
+# Be tolerant to truncated/corrupt images when loading with PIL
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 logging.basicConfig(level=logging.INFO)
@@ -143,7 +149,7 @@ class VideoDepthDataset(Dataset):
         return sum(max(0, seq['num_frames'] - self.snippet_len + 1) 
                    for seq in self.sequences)
     
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Optional[Dict[str, torch.Tensor]]:
         # Find which sequence and position this index corresponds to
         current_idx = 0
         for seq in self.sequences:
@@ -156,7 +162,7 @@ class VideoDepthDataset(Dataset):
         
         raise IndexError(f"Index {idx} out of range")
     
-    def _get_snippet(self, seq: Dict, snippet_idx: int) -> Dict[str, torch.Tensor]:
+    def _get_snippet(self, seq: Dict, snippet_idx: int) -> Optional[Dict[str, torch.Tensor]]:
         """Get a snippet of frames from a sequence"""
         # Select frame indices
         start_idx = snippet_idx
@@ -167,7 +173,10 @@ class VideoDepthDataset(Dataset):
         rgb_frames = []
         for i in frame_indices:
             rgb_path = seq['rgb_frames'][i]
-            rgb = self._load_image(rgb_path)  # [3, H, W] in [0, 1]
+            rgb = self._load_image(rgb_path)  # [3, H, W] in [-1, 1]
+            if rgb is None:
+                logger.warning(f"Skipping snippet due to corrupt RGB: {rgb_path}")
+                return None
             rgb_frames.append(rgb)
         rgb_frames = torch.stack(rgb_frames, dim=0)  # [T, 3, H, W]
         
@@ -176,6 +185,9 @@ class VideoDepthDataset(Dataset):
         for i in frame_indices:
             depth_path = seq['depth_frames'][i]
             depth = self._load_depth(depth_path)  # [1, H, W]
+            if depth is None:
+                logger.warning(f"Skipping snippet due to corrupt depth: {depth_path}")
+                return None
             depth_frames.append(depth)
         depth_frames = torch.stack(depth_frames, dim=0)  # [T, 1, H, W]
         
@@ -189,23 +201,26 @@ class VideoDepthDataset(Dataset):
             'video_name': str(seq['video_dir'].name),
         }
     
-    def _load_image(self, image_path: Path) -> torch.Tensor:
+    def _load_image(self, image_path: Path) -> Optional[torch.Tensor]:
         """Load and preprocess image"""
-        from PIL import Image
-        
-        image = Image.open(image_path).convert('RGB')
+        try:
+            pil_img = Image.open(image_path).convert('RGB')
+        except Exception as e:
+            logger.warning(f"Failed to load RGB image {image_path}: {e}. Skipping.")
+            return None
+
         # Resize to target size
-        image = image.resize(self.image_size, Image.Resampling.BILINEAR)
+        pil_img = pil_img.resize(self.image_size, Image.Resampling.BILINEAR)
         # Convert to tensor [0, 1]
-        image = torch.from_numpy(np.array(image)).float() / 255.0
+        img_tensor = torch.from_numpy(np.array(pil_img)).float() / 255.0
         # Normalize to [-1, 1] as per diffusers convention
-        image = image * 2.0 - 1.0
+        img_tensor = img_tensor * 2.0 - 1.0
         # Rearrange to [C, H, W]
-        image = einops.rearrange(image, 'h w c -> c h w')
-        
-        return image
+        img_tensor = einops.rearrange(img_tensor, 'h w c -> c h w')
+
+        return img_tensor
     
-    def _load_depth(self, depth_path: Path) -> torch.Tensor:
+    def _load_depth(self, depth_path: Path) -> Optional[torch.Tensor]:
         """Load depth map and recover RollingDepth [-1, 1] format
         
         Inverse of create_orb_slam_input.py encoding:
@@ -216,39 +231,46 @@ class VideoDepthDataset(Dataset):
         """
         if depth_path.suffix == '.npy':
             # NPY files are assumed to be already in the correct format
-            depth = np.load(depth_path)
+            try:
+                depth = np.load(depth_path)
+            except Exception as e:
+                logger.warning(f"Failed to load depth npy {depth_path}: {e}. Skipping.")
+                return None
         else:  # .png (uint16 saved by simulator via create_orb_slam_input.py)
-            from PIL import Image
-            depth_img = Image.open(depth_path)
-            depth_uint16 = np.array(depth_img).astype(np.float32)
-            
-            # STEP 1: Recover depth_linear from uint16
-            # (inverse of: depth_scaled = depth_linear * depth_map_factor)
-            depth_linear = depth_uint16 / self.depth_map_factor
-            
-            # STEP 2: Reverse the linearization formula
-            # Original: depth_linear = (2*np*fp) / (fp+np - (2*depth_normalized-1)*(fp-np))
-            # Solve for depth_normalized:
-            # depth_linear * (fp+np - (2*depth_normalized-1)*(fp-np)) = 2*np*fp
-            # depth_linear * (fp+np) - depth_linear*(2*depth_normalized-1)*(fp-np) = 2*np*fp
-            # -depth_linear*(2*depth_normalized-1)*(fp-np) = 2*np*fp - depth_linear*(fp+np)
-            # (2*depth_normalized-1) = (2*np*fp - depth_linear*(fp+np)) / (depth_linear*(fp-np))
-            # depth_normalized = ((2*np*fp - depth_linear*(fp+np)) / (depth_linear*(fp-np)) + 1) / 2
-            near_plane = self.depth_range[0]
-            far_plane = self.depth_range[1]
-            
-            # Avoid division by zero
-            depth_linear = np.clip(depth_linear, 1e-6, np.inf)
-            
-            numerator = 2.0 * near_plane * far_plane - depth_linear * (far_plane + near_plane)
-            denominator = depth_linear * (far_plane - near_plane)
-            depth_normalized = (numerator / denominator + 1.0) / 2.0
-            depth_normalized = np.clip(depth_normalized, 0.0, 1.0)
-            
-            # STEP 3: Invert back (reverse of: depth_normalized = 1.0 - depth_normalized)
-            depth_normalized = 1.0 - depth_normalized
-            
-            depth = depth_normalized
+            try:
+                depth_img = Image.open(depth_path)
+                depth_uint16 = np.array(depth_img).astype(np.float32)
+
+                # STEP 1: Recover depth_linear from uint16
+                # (inverse of: depth_scaled = depth_linear * depth_map_factor)
+                depth_linear = depth_uint16 / self.depth_map_factor
+
+                # STEP 2: Reverse the linearization formula
+                # Original: depth_linear = (2*np*fp) / (fp+np - (2*depth_normalized-1)*(fp-np))
+                # Solve for depth_normalized:
+                # depth_linear * (fp+np - (2*depth_normalized-1)*(fp-np)) = 2*np*fp
+                # depth_linear * (fp+np) - depth_linear*(2*depth_normalized-1)*(fp-np) = 2*np*fp
+                # -depth_linear*(2*depth_normalized-1)*(fp-np) = 2*np*fp - depth_linear*(fp+np)
+                # (2*depth_normalized-1) = (2*np*fp - depth_linear*(fp+np)) / (depth_linear*(fp-np))
+                # depth_normalized = ((2*np*fp - depth_linear*(fp+np)) / (depth_linear*(fp-np)) + 1) / 2
+                near_plane = self.depth_range[0]
+                far_plane = self.depth_range[1]
+
+                # Avoid division by zero
+                depth_linear = np.clip(depth_linear, 1e-6, np.inf)
+
+                numerator = 2.0 * near_plane * far_plane - depth_linear * (far_plane + near_plane)
+                denominator = depth_linear * (far_plane - near_plane)
+                depth_normalized = (numerator / denominator + 1.0) / 2.0
+                depth_normalized = np.clip(depth_normalized, 0.0, 1.0)
+
+                # STEP 3: Invert back (reverse of: depth_normalized = 1.0 - depth_normalized)
+                depth_normalized = 1.0 - depth_normalized
+
+                depth = depth_normalized
+            except Exception as e:
+                logger.warning(f"Failed to load depth png {depth_path}: {e}. Skipping.")
+                return None
         
         # Handle different array shapes
         if depth.ndim == 3:
@@ -293,6 +315,8 @@ class RollingDepthTrainer:
         lora_rank: int = 16,
         lora_alpha: int = 32,
         device: str = 'cuda',
+        depth_recon_weight: float = 0.1,
+        save_every_steps: int = 0,
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -309,6 +333,8 @@ class RollingDepthTrainer:
         self.mixed_precision = mixed_precision
         self.use_lora = use_lora
         self.device = device
+        self.depth_recon_weight = depth_recon_weight
+        self.save_every_steps = save_every_steps  # 0 disables periodic saving
         
         # Setup mixed precision (disable autocast if using GradScaler)
         self.scaler = torch.amp.GradScaler('cuda') if mixed_precision == 'fp16' else None
@@ -331,6 +357,9 @@ class RollingDepthTrainer:
         
         # Freeze VAE and text encoder (only train UNet)
         self._freeze_encoder_and_vae()
+        
+        # Enable gradient checkpointing to save GPU memory
+        self.unet.enable_gradient_checkpointing()
         
         # Setup optimizer
         self.optimizer = AdamW(
@@ -392,9 +421,29 @@ class RollingDepthTrainer:
         logger.info(f"Trainable parameters: {self._count_trainable_params()}")
         logger.info(f"Batch size: {self.batch_size} (effective: {self.batch_size * self.gradient_accumulation_steps})")
         logger.info(f"Total iterations: {len(train_dataloader) * self.num_epochs // (self.batch_size * self.gradient_accumulation_steps)}")
-        # Setup learning rate scheduler
-        total_steps = len(train_dataloader) * self.num_epochs // self.gradient_accumulation_steps
-        self.lr_scheduler = CosineAnnealingLR(self.optimizer, T_max=total_steps)
+        # Setup learning rate scheduler: Linear warmup -> Cosine decay
+        self.val_dataloader = val_dataloader
+        # total_steps = max(1, len(train_dataloader) * self.num_epochs // self.gradient_accumulation_steps)
+        total_steps = max(1, len(train_dataloader) * self.num_epochs)
+
+        if self.warmup_steps > 0 and total_steps > self.warmup_steps:
+            warmup = LinearLR(
+                self.optimizer,
+                start_factor=1e-6,
+                end_factor=1.0,
+                total_iters=self.warmup_steps,
+            )
+            cosine = CosineAnnealingLR(
+                self.optimizer,
+                T_max=max(1, total_steps - self.warmup_steps),
+            )
+            self.lr_scheduler = SequentialLR(
+                self.optimizer,
+                schedulers=[warmup, cosine],
+                milestones=[self.warmup_steps],
+            )
+        else:
+            self.lr_scheduler = CosineAnnealingLR(self.optimizer, T_max=total_steps)
         
         best_val_loss = float('inf')
         
@@ -406,6 +455,10 @@ class RollingDepthTrainer:
             # Train
             train_loss = self._train_epoch(train_dataloader)
             logger.info(f"Train loss: {train_loss:.6f}")
+
+            # Clean memory
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
             
             # Validate
             if val_dataloader is not None:
@@ -436,6 +489,9 @@ class RollingDepthTrainer:
         pbar = tqdm(dataloader, desc="Training", leave=True, unit="batch")
         for batch_idx, batch in enumerate(pbar):
             try:
+                # Skip empty batches (all samples filtered out)
+                if batch is None:
+                    continue
                 # Move to device
                 rgb = batch['rgb'].to(self.device)  # [B, T, 3, H, W]
                 depth_gt = batch['depth'].to(self.device)  # [B, T, 1, H, W]
@@ -471,6 +527,26 @@ class RollingDepthTrainer:
                         self.lr_scheduler.step()
                     
                     self.global_step += 1
+
+                    # Periodic validation every 500 optimizer steps 
+                    if (
+                        getattr(self, 'val_dataloader', None) is not None
+                        and self.global_step % 500 == 0
+                    ):
+                        try:
+                            val_loss = self._validate(self.val_dataloader)  # type: ignore[arg-type]
+                            logger.info(f"Step {self.global_step}: Val loss: {val_loss:.6f}")
+                        except Exception as _e:
+                            logger.warning(f"Validation at step {self.global_step} failed: {_e}")
+
+                    # Periodic full checkpoint save (CPU-offloaded) after grads are cleared
+                    if self.save_every_steps and (self.global_step % self.save_every_steps == 0):
+                        try:
+                            with torch.no_grad():
+                                torch.cuda.empty_cache()
+                                self._save_checkpoint_step_cpu()
+                        except Exception as _e:
+                            logger.warning(f"Step checkpoint save failed at step {self.global_step}: {_e}")
                 
                 total_loss += loss.item() * self.gradient_accumulation_steps
                 avg_batch_loss = total_loss / (batch_idx + 1)
@@ -528,8 +604,9 @@ class RollingDepthTrainer:
             
             # Add noise (forward diffusion)
             noisy_depth_latent = self.pipeline.scheduler.add_noise(
-                depth_gt_latent, noise, timesteps[0]
+                depth_gt_latent, noise, timesteps
             )
+
         
         # Cast latents to model dtype
         rgb_latent = rgb_latent.to(dtype)
@@ -567,8 +644,35 @@ class RollingDepthTrainer:
         # Reshape back to [B, T, 4, h, w]
         noise_pred = einops.rearrange(noise_pred, "(b t) c h w -> b t c h w", b=B_orig)
         
-        # MSE loss between predicted and actual noise
-        loss = F.mse_loss(noise_pred, noise)
+        # MSE loss between predicted and actual noise (standard diffusion objective)
+        loss_noise = F.mse_loss(noise_pred, noise)
+
+        # Optional depth reconstruction loss, controlled by CLI weight
+        if self.depth_recon_weight > 0.0:
+            try:
+                # Use the same timestep used in add_noise (timesteps[0]) to compute scalings
+                alphas_cumprod = self.pipeline.scheduler.alphas_cumprod.to(self.device)
+                t0 = timesteps[0].item() if isinstance(timesteps, torch.Tensor) else int(timesteps)
+                sqrt_alpha = torch.sqrt(alphas_cumprod[t0]).to(dtype).view(1, 1, 1, 1, 1)
+                sqrt_one_minus = torch.sqrt(1.0 - alphas_cumprod[t0]).to(dtype).view(1, 1, 1, 1, 1)
+
+                # Predict clean depth latent x0 from noisy sample and predicted noise
+                pred_depth_latent = (noisy_depth_latent - sqrt_one_minus * noise_pred) / (sqrt_alpha + 1e-6)
+
+                # Decode to depth image space ([-1, 1])
+                depth_pred_img = self.pipeline.decode_depth(pred_depth_latent, max_batch_size=B_orig, verbose=False)
+
+                # L1 depth reconstruction loss in model's training space ([-1,1])
+                loss_depth = F.l1_loss(depth_pred_img, depth_gt)
+            except Exception as _e:
+                # Fallback: if scheduler/meta mismatches, skip depth loss for this step
+                logger.debug(f"Depth reconstruction loss skipped due to: {_e}")
+                loss_depth = torch.tensor(0.0, device=self.device, dtype=dtype)
+        else:
+            loss_depth = torch.tensor(0.0, device=self.device, dtype=dtype)
+
+        # Combine losses with configurable weight on depth reconstruction to preserve diffusion objective
+        loss = loss_noise + self.depth_recon_weight * loss_depth
         
         return loss
     
@@ -580,6 +684,8 @@ class RollingDepthTrainer:
         with torch.no_grad():
             pbar = tqdm(dataloader, desc="Validating", leave=False, unit="batch")
             for batch in pbar:
+                if batch is None:
+                    continue
                 rgb = batch['rgb'].to(self.device)
                 depth_gt = batch['depth'].to(self.device)
                 
@@ -622,6 +728,67 @@ class RollingDepthTrainer:
         with open(history_path, 'w') as f:
             json.dump(self.training_history, f, indent=2)
 
+    def _save_checkpoint_step_cpu(self):
+        """Save a full pipeline checkpoint at the current step by cloning modules to CPU.
+        Avoids moving the live training model (which would break the optimizer param refs).
+        """
+        save_dir = self.run_dir / f"checkpoint_step_{self.global_step}"
+        save_dir.mkdir(exist_ok=True)
+
+        # Build CPU copies of components from configs and load current state dicts
+        try:
+            from diffusers import UNet2DConditionModel, AutoencoderKL
+            from transformers import CLIPTextModel
+
+            # UNet (CPU clone)
+            unet_cpu = UNet2DConditionModel.from_config(self.pipeline.unet.config)
+            unet_cpu.load_state_dict({k: v.detach().cpu() for k, v in self.pipeline.unet.state_dict().items()}, strict=True)
+
+            # VAE (CPU clone)
+            vae_cpu = AutoencoderKL.from_config(self.pipeline.vae.config)
+            vae_cpu.load_state_dict({k: v.detach().cpu() for k, v in self.pipeline.vae.state_dict().items()}, strict=True)
+
+            # Scheduler (config only)
+            scheduler_cpu = DDIMScheduler.from_config(self.pipeline.scheduler.config)
+
+            # Text encoder (CPU clone)
+            text_enc_cpu = CLIPTextModel(self.pipeline.text_encoder.config)
+            text_enc_cpu.load_state_dict({k: v.detach().cpu() for k, v in self.pipeline.text_encoder.state_dict().items()}, strict=True)
+
+            # Tokenizer: reuse the existing tokenizer object (it saves its files to disk)
+            tokenizer_obj = self.pipeline.tokenizer
+
+            # Assemble a temporary CPU pipeline and save
+            cpu_pipeline = RollingDepthPipeline(
+                unet=unet_cpu,
+                vae=vae_cpu,
+                scheduler=scheduler_cpu,
+                text_encoder=text_enc_cpu,
+                tokenizer=tokenizer_obj,
+            )
+            cpu_pipeline.save_pretrained(str(save_dir))
+
+            # Save training config (step-level)
+            step_cfg = {
+                'epoch': None,
+                'global_step': self.global_step,
+                'learning_rate': self.learning_rate,
+                'batch_size': self.batch_size,
+                'gradient_accumulation_steps': self.gradient_accumulation_steps,
+                'use_lora': self.use_lora,
+                'mixed_precision': self.mixed_precision,
+            }
+            with open(save_dir / "training_config.json", 'w') as f:
+                json.dump(step_cfg, f, indent=2)
+
+            logger.info(f"Step checkpoint saved to {save_dir}")
+        finally:
+            # Cleanup CPU copies to free RAM
+            try:
+                del unet_cpu, vae_cpu, scheduler_cpu, text_enc_cpu, cpu_pipeline
+            except Exception:
+                pass
+
 
 def main():
     parser = argparse.ArgumentParser(description="Finetune RollingDepth model")
@@ -660,6 +827,8 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--num_epochs", type=int, default=10)
     parser.add_argument("--warmup_steps", type=int, default=500)
+    parser.add_argument("--depth_recon_weight", type=float, default=0.1, help="Weight for optional depth reconstruction loss (set 0 to disable)")
+    parser.add_argument("--save_every_steps", type=int, default=0, help="Save a full CPU-offloaded checkpoint every N optimizer steps (0 disables)")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--mixed_precision", choices=['fp16', 'fp32'], default='fp16')
     
@@ -699,11 +868,23 @@ def main():
         depth_map_factor=args.depth_map_factor,
     )
     
+    # Collate function that skips None samples (from corrupt frames)
+    def collate_skip_none(batch):
+        batch = [b for b in batch if b is not None]
+        if len(batch) == 0:
+            return None
+        return {
+            'rgb': torch.stack([b['rgb'] for b in batch], dim=0),
+            'depth': torch.stack([b['depth'] for b in batch], dim=0),
+            'video_name': [b['video_name'] for b in batch],
+        }
+
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
+        collate_fn=collate_skip_none,
     )
     
     val_dataloader = None
@@ -721,6 +902,7 @@ def main():
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=args.num_workers,
+            collate_fn=collate_skip_none,
         )
     
     # Create trainer
@@ -738,6 +920,8 @@ def main():
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         device=args.device,
+        depth_recon_weight=args.depth_recon_weight,
+        save_every_steps=args.save_every_steps,
     )
     
     # Train

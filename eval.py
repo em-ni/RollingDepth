@@ -9,6 +9,10 @@ import torch
 import cv2
 from PIL import Image
 from tqdm import tqdm
+import re
+import json
+from datetime import datetime
+import os
 
 from rollingdepth import RollingDepthPipeline
 
@@ -72,10 +76,40 @@ def evaluate_dataset(dataset_dir, checkpoint="prs-eth/rollingdepth-v1-0", depth_
     
     logger.info(f"Found {len(video_dirs)} videos")
     
+    # Resolve local checkpoints robustly (accept Windows-style backslashes or concatenated input)
+    def _resolve_checkpoint_path(ckpt: str) -> str:
+        s = str(ckpt).strip()
+        # 1) Direct path try (normalize backslashes to os.sep)
+        candidate = Path(s.replace("\\", os.sep)).expanduser()
+        if candidate.exists():
+            logger.info(f"Using local checkpoint: {candidate}")
+            return str(candidate)
+
+        # 2) Try reconstructing pattern like 'finetuned20251026_112027checkpoint_step_750'
+        m = re.search(r"(\d{8}_\d{6})", s)
+        if m:
+            ts = m.group(1)
+            prefix = s[: m.start(1)]
+            suffix = s[m.end(1) :]
+            parts = [prefix, ts, suffix]
+            parts = [p.strip("/\\") for p in parts if p]
+            recon = Path(*parts).expanduser()
+            if recon.exists():
+                logger.info(f"Resolved concatenated checkpoint to local path: {recon}")
+                return str(recon)
+
+        # 3) Fallback: keep original (assume HF hub id)
+        return s
+
+    resolved_checkpoint = _resolve_checkpoint_path(checkpoint)
+
     # Load model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    pipe = RollingDepthPipeline.from_pretrained(checkpoint, torch_dtype=torch.float16)
+    pipe = RollingDepthPipeline.from_pretrained(resolved_checkpoint, torch_dtype=torch.float16)
     pipe = pipe.to(device)
+
+    # Use a filesystem-safe folder name derived from the checkpoint for predictions
+    pred_folder_name = re.sub(r"[^A-Za-z0-9._-]+", "_", str(checkpoint).strip())
     
     # Evaluation parameters
     fps = 15
@@ -84,12 +118,14 @@ def evaluate_dataset(dataset_dir, checkpoint="prs-eth/rollingdepth-v1-0", depth_
 
     all_mae = []
     all_rmse = []
+    per_video_summaries = []
     
     for video_dir in tqdm(video_dirs, desc="Videos", unit="video"):
         rgb_dir = video_dir / "rgb"
         depth_dir = video_dir / "depth"
-        pred_dir = video_dir / "pred"
-        pred_dir.mkdir(exist_ok=True)  # Create pred folder for this video
+        pred_dir = video_dir / pred_folder_name
+        pred_dir.mkdir(exist_ok=True)  # Create per-video predictions folder named after checkpoint
+        video_chunk_metrics = []  # collect per-chunk metrics for this video
         
         num_rgb = len(list(rgb_dir.glob("*.png")))
         num_depth = len(list(depth_dir.glob("*.png")))
@@ -160,10 +196,16 @@ def evaluate_dataset(dataset_dir, checkpoint="prs-eth/rollingdepth-v1-0", depth_
             valid_mask = (gt_depth > 0.0) & np.isfinite(gt_depth)
             if valid_mask.sum() > 0:
                 diff = (aligned_pred_depth_m - gt_depth)[valid_mask]
-                mae = np.abs(diff).mean()
-                rmse = np.sqrt((diff ** 2).mean())
-                all_mae.append(float(mae))
-                all_rmse.append(float(rmse))
+                mae = float(np.abs(diff).mean())
+                rmse = float(np.sqrt((diff ** 2).mean()))
+                all_mae.append(mae)
+                all_rmse.append(rmse)
+                video_chunk_metrics.append({
+                    "chunk_idx": int(chunk_idx),
+                    "frames_evaluated": int(min_frames),
+                    "mae_m": mae,
+                    "rmse_m": rmse,
+                })
                 tqdm.write(f"    Chunk {chunk_idx}: MAE={mae:.4f}m, RMSE={rmse:.4f}m")
 
             # Save aligned predicted depth frames as uint16 PNG using GT filenames
@@ -177,14 +219,63 @@ def evaluate_dataset(dataset_dir, checkpoint="prs-eth/rollingdepth-v1-0", depth_
                     pred_img.save(str(pred_filepath))
             
             temp_video.unlink()
+
+        # Save per-video metrics summary
+        if video_chunk_metrics:
+            v_mae = [m["mae_m"] for m in video_chunk_metrics]
+            v_rmse = [m["rmse_m"] for m in video_chunk_metrics]
+            video_summary = {
+                "checkpoint": str(checkpoint),
+                "video": video_dir.name,
+                "pred_folder": pred_folder_name,
+                "num_chunks": int(num_chunks),
+                "evaluated_chunks": int(len(video_chunk_metrics)),
+                "metrics": {
+                    "MAE_mean_m": float(np.mean(v_mae)),
+                    "MAE_std_m": float(np.std(v_mae)),
+                    "RMSE_mean_m": float(np.mean(v_rmse)),
+                    "RMSE_std_m": float(np.std(v_rmse)),
+                },
+                "chunks": video_chunk_metrics,
+                "depth_map_factor": float(depth_map_factor),
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            }
+            per_video_summaries.append(video_summary)
+            with open(pred_dir / "metrics.json", "w") as f:
+                json.dump(video_summary, f, indent=2)
     
     # Summary
     if all_mae:
+        overall = {
+            "checkpoint": str(checkpoint),
+            "pred_folder": pred_folder_name,
+            "videos": int(len(video_dirs)),
+            "evaluated_chunks": int(len(all_mae)),
+            "metrics": {
+                "MAE_mean_m": float(np.mean(all_mae)),
+                "MAE_std_m": float(np.std(all_mae)),
+                "RMSE_mean_m": float(np.mean(all_rmse)),
+                "RMSE_std_m": float(np.std(all_rmse)),
+            },
+            "depth_map_factor": float(depth_map_factor),
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "per_video": per_video_summaries,
+        }
         tqdm.write(f"\n{'='*50}")
-        tqdm.write(f"Evaluated {len(all_mae)} chunks")
-        tqdm.write(f"Overall MAE:  {np.mean(all_mae):.4f}m (±{np.std(all_mae):.4f})")
-        tqdm.write(f"Overall RMSE: {np.mean(all_rmse):.4f}m (±{np.std(all_rmse):.4f})")
+        tqdm.write(f"Evaluated {overall['evaluated_chunks']} chunks across {overall['videos']} videos")
+        tqdm.write(
+            f"Overall MAE:  {overall['metrics']['MAE_mean_m']:.4f}m (±{overall['metrics']['MAE_std_m']:.4f})"
+        )
+        tqdm.write(
+            f"Overall RMSE: {overall['metrics']['RMSE_mean_m']:.4f}m (±{overall['metrics']['RMSE_std_m']:.4f})"
+        )
         tqdm.write(f"{'='*50}")
+
+        # Save overall metrics next to dataset
+        overall_path = Path(dataset_dir) / f"metrics_{pred_folder_name}.json"
+        with open(overall_path, "w") as f:
+            json.dump(overall, f, indent=2)
+        tqdm.write(f"Saved overall metrics: {overall_path}")
 
 
 if __name__ == "__main__":
